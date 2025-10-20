@@ -560,11 +560,11 @@ def plot_ff_2d(
     if ax is None:
         _, ax = plt.subplots(1, 1, figsize=(8, 6))
 
-    theta_deg, phi_deg = np.degrees(theta_rad), np.degrees(phi_rad)
-    extent = (np.min(theta_deg), np.max(theta_deg), np.min(phi_deg), np.max(phi_deg))
-    aspect = theta_deg.size / phi_deg.size
+    theta_deg, phi_deg= np.degrees(theta_rad), np.degrees(phi_rad)
+    extent = (np.min(phi_deg), np.max(phi_deg), np.min(theta_deg), np.max(theta_deg))
+    aspect = phi_deg.size / theta_deg.size
     im = ax.imshow(pattern, extent=extent, origin="lower", aspect=aspect)
-    ax.set(xticks=theta_deg[::30], yticks=phi_deg[::30], xlabel="θ°", ylabel="φ°")
+    ax.set(yticks=theta_deg[::30], xticks=phi_deg[::90], ylabel="θ°", xlabel="φ°")
     ax.set_title(title)
 
     if colorbar:

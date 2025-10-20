@@ -1,0 +1,470 @@
+
+mode = 'test_single'; % 'test_single' | 'evaluate_grid'
+tic()
+switch mode
+    case 'test_single'
+        env0_name = 'no_env_rotated';
+        env1_name = 'Env1_rotated';
+        taper = 'hamming';
+        loss_fn = @mse_loss;
+        loss_scale = 'linear'; % or 'db'
+        lr = 1e-5;
+
+        elev_deg = 0;
+        azim_deg = azim_degs(i);
+
+        [res, w] = run_optimization(env0_name, env1_name, taper, elev_deg, azim_deg, loss_fn, loss_scale, lr, true);
+    case 'evaluate_grid'
+        milestone()
+end
+fprintf('total runtime is: %.0f sec = %.1f min\n', toc(), toc()/60);
+
+
+function milestone()
+% MATLAB port of src/milestone.py with plotting and interactivity tweaks
+% - Loads CST patterns for two environments
+% - Builds initial tapered/steered weights
+% - Runs gradient optimization to match target power pattern
+% - Evaluates a grid of pointings and saves ΔNMSE plots
+% Default call replicates the Python evaluation grid output.
+    tic()
+    env = 'Env1_rotated';
+    taper = 'hamming';
+    loss_scale = 'linear';
+    lr = 1e-6;
+    evaluate_grid('no_env_rotated', env, taper, @mse_loss, loss_scale, lr);
+    fprintf('total runtime is: %.0f sec = %.1f min\n', toc(), toc()/60);
+    fprintf('done!')
+end
+
+% ========================= Top-level API =========================
+function evaluate_grid(env0_name, env1_name, taper, loss_fn, loss_scale, lr)
+    if nargin < 1 || isempty(env0_name), env0_name = 'no_env_rotated'; end
+    if nargin < 2 || isempty(env1_name), env1_name = 'Env1_rotated'; end
+    if nargin < 3 || isempty(taper),     taper = 'hamming'; end
+    if nargin < 4 || isempty(loss_fn),   loss_fn = @mse_loss; end
+    if nargin < 5 || isempty(loss_scale), loss_scale = 'db'; end
+    if nargin < 6 || isempty(lr),        lr = 5e-6; end
+
+    elevs = 0:10:30;      % 0, 15, 30
+    azims = 0:30:360;     % 0, 90, 180, 270
+
+    % Evaluate optimization at each grid point
+    results = cell(numel(elevs), numel(azims));
+    for ei = 1:numel(elevs)
+        for ai = 1:numel(azims)
+            elev_deg = elevs(ei);
+            azim_deg = azims(ai);
+            [res, w] = run_optimization(env0_name, env1_name, taper, elev_deg, azim_deg, loss_fn, loss_scale, lr, false);
+            results{ei, ai} = res;
+        end
+    end
+
+    % Aggregate NMSE
+    nmses_env1 = zeros(numel(elevs), numel(azims));
+    nmses_opt  = zeros(numel(elevs), numel(azims));
+    for ei = 1:numel(elevs)
+        for ai = 1:numel(azims)
+            r = results{ei, ai};
+            nmses_env1(ei, ai) = r.nmse_env1;
+            nmses_opt(ei, ai)  = r.nmse_opt;
+        end
+    end
+
+    nmse_diff = nmses_opt - nmses_env1; % match Python
+    fprintf('Mean NMSE Improvement: %.3f dB\n', mean(nmse_diff(:)));
+    fprintf('Std NMSE Improvement: %.3f dB\n', std(nmse_diff(:)));
+    fprintf('Max NMSE Improvement: %.3f dB\n', max(nmse_diff(:)));
+    fprintf('Min NMSE Improvement: %.3f dB\n', min(nmse_diff(:)));
+
+    % Polar-like colored mesh: θ = azim, r = elev
+    azim_rad = deg2rad(azims);
+    [TH, R] = meshgrid(azim_rad, elevs);
+    % Match Python orientation: 0° at North and clockwise θ direction
+    X = R .* sin(TH);
+    Y = R .* cos(TH);
+
+    fig = figure('Position',[100 100 750 750]);
+    ax = axes(fig); %#ok<LAXES>
+    pcolor(ax, X, Y, nmse_diff); shading(ax, 'flat'); axis(ax, 'equal'); axis(ax, 'tight');
+    clim = max(abs(nmse_diff(:))); caxis(ax, [-clim, clim]);
+    colormap(ax, bwr_blue_positive()); % Blue=positive, White=0, Red=negative
+    cb = colorbar(ax); cb.Label.String = 'NMSE (dB)';
+    title(ax, sprintf('\x0394NMSE | %s taper | %s vs %s | %s (%s) | lr=%.1e', ...
+        taper, env0_name, env1_name, func2str(loss_fn), loss_scale, lr));
+
+    % Enable interactive data tips to read values (azim, elev, ΔNMSE)
+    enable_datatip(fig, TH, R, nmse_diff);
+
+    % Save figure with MATLAB_ prefix to distinguish runs
+    envs_fname = sprintf('%s_vs_%s', strrep(env0_name,' ','_'), strrep(env1_name,' ','_'));
+    name = sprintf('MATLAB_patterns_nmse_%s_%s_%s_%s_lr_%.1e.png', taper, envs_fname, func2str(loss_fn), loss_scale, lr);
+    exportgraphics(fig, name, 'Resolution', 200);
+end
+
+function [res, w] = run_optimization(env0_name, env1_name, taper, elev_deg, azim_deg, loss_fn, loss_scale, lr, do_plot)
+    if nargin < 9, do_plot = true; end
+    fprintf('Running optimization for elev %g°, azim %g°, %s taper\n', elev_deg, azim_deg, taper);
+
+    params = init_params(env0_name, env1_name, taper, elev_deg, azim_deg);
+    w = params.w;
+    aeps_env1 = params.aeps_env1;
+    power_env0 = params.power_env0;
+
+    [power_db_opt, w] = optimize(w, aeps_env1, power_env0, loss_fn, loss_scale, lr);
+
+    power_db_env0 = to_db(params.power_env0);
+    power_db_env1 = to_db(params.power_env1);
+
+    % Normalize by mean square of target in dB (match Python)
+    norm_factor = mean(power_db_env0(:).^2);
+    mse_env1_raw = mean((power_db_env1(:) - power_db_env0(:)).^2);
+    mse_opt_raw  = mean((power_db_opt(:)  - power_db_env0(:)).^2);
+
+    nmse_env1 = 10*log10(mse_env1_raw / norm_factor);
+    nmse_opt  = 10*log10(mse_opt_raw  / norm_factor);
+
+    if do_plot
+        % Quick sanity checks on invariances
+        % t0_std_env0 = std(power_db_env0(1,:)); % theta=0 should be constant across phi
+        % p0_std_env0 = std(power_db_env0(:,1)); % phi=0 not necessarily constant across theta
+        % fprintf('Sanity: std(power_db_env0(theta=0,:))=%.4f, std(power_db_env0(:,phi=0))=%.4f\n', t0_std_env0, p0_std_env0);
+
+        fig = figure('Position',[100 100 1500 1000]);
+        tl = tiledlayout(fig, 3, 3, 'Padding','compact', 'TileSpacing','compact');
+
+        draw_pattern_row(tl, 1, power_db_env0', 'No Env');
+        draw_pattern_row(tl, 2, power_db_env1', sprintf('Env 1 | NMSE %.3fdB', nmse_env1));
+        draw_pattern_row(tl, 3, power_db_opt',  sprintf('Optimized | NMSE %.3fdB', nmse_opt));
+
+        steer_title = sprintf('Steering Elev %d°, Azim %d°', round(elev_deg), round(azim_deg));
+        title(tl, sprintf('%s taper | %s', taper, steer_title));
+
+        name = sprintf('MATLAB_patterns_%s_elev_%d_azim_%d.png', taper, round(elev_deg), round(azim_deg));
+        exportgraphics(fig, name, 'Resolution', 200);
+        fprintf('Saved figure to %s\n', name);
+
+        w = w .* exp(-1i*angle(w(2,2)));
+
+        % Additional weights visualization (magnitude and phase)
+        figW = figure('Position',[100 100 900 400]);
+        tW = tiledlayout(figW,1,2,'Padding','compact','TileSpacing','compact');
+        ax1 = nexttile(tW,1);
+        imagesc(ax1, abs(w)); axis(ax1,'image'); colorbar(ax1);
+        title(ax1, 'w magnitude'); xlabel(ax1,'x index'); ylabel(ax1,'y index');
+        ax2 = nexttile(tW,2);
+        imagesc(ax2, rad2deg(angle(w))); axis(ax2,'image'); colorbar(ax2);
+        colormap(ax2, 'hsv'); caxis(ax2, [-180, 180]);
+        title(ax2, 'w phase (deg)'); xlabel(ax2,'x index'); ylabel(ax2,'y index');
+        nameW = sprintf('MATLAB_weights_%s_elev_%d_azim_%d.png', taper, round(elev_deg), round(azim_deg));
+        exportgraphics(figW, nameW, 'Resolution', 200);
+    end
+
+    res = struct('power_db_opt', power_db_opt, 'nmse_env1', nmse_env1, 'nmse_opt', nmse_opt);
+end
+
+% ========================= Optimization =========================
+function [power_db_opt, w] = optimize(w_init, aeps, target_power, loss_fn, loss_scale, lr)
+    w = w_init; % complex (n_x, n_y)
+    nsteps = 100;
+    for step = 0:nsteps-1
+        [w, loss] = train_step(w, aeps, target_power, lr, loss_fn, loss_scale);
+        if mod(step,10) == 0
+            fprintf('step %d, loss: %.3f\n', step, real(loss));
+        end
+    end
+    fprintf('Weight norm: %.3f\n', norm(w(:)));
+
+    pattern_opt = synthesize_field(aeps, w);      % (t,p,z)
+    power_db_opt = to_db(to_power(pattern_opt));  % (t,p)
+end
+
+function [w_next, loss_val] = train_step(w, aeps, target_power, lr, loss_fn, loss_scale)
+    % Compute prediction
+    field = synthesize_field(aeps, w);   % (t,p,z)
+    pred_power = to_power(field);        % (t,p)
+
+    % Potentially compute in dB for the loss
+    if strcmpi(loss_scale, 'db')
+        pred_eval = to_db(pred_power);
+        target_eval = to_db(target_power);
+    else
+        pred_eval = pred_power;
+        target_eval = target_power;
+    end
+
+    loss_val = loss_fn(pred_eval, target_eval);
+
+    % Gradient wrt conjugate weights (Wirtinger)
+    E = pred_eval - target_eval;   % (t,p)
+    N = numel(E);
+    if strcmpi(loss_scale, 'db')
+        % d/dP [10 log10(P)] = 10 / (ln(10) * P)
+        alpha = 10 / log(10);
+        dL_dP = (2/N) * (E .* (alpha ./ max(pred_power, realmin)));
+    else
+        dL_dP = (2/N) * E;
+    end
+
+    G_tpz = dL_dP .* field; % (t,p,z)
+    G_full = conj(aeps) .* reshape(G_tpz, [1 1 size(G_tpz,1) size(G_tpz,2) size(G_tpz,3)]);
+    G = squeeze(sum(sum(sum(G_full, 5), 4), 3));  % (nx,ny)
+
+    w_next = w - lr * G;
+end
+
+% ========================= Parameters, Data =========================
+function params = init_params(env0_name, env1_name, taper, elev_deg, azim_deg)
+    % Root directory is one level up from this file's folder
+    this_file = mfilename('fullpath');
+    this_dir = fileparts(this_file);
+    root_dir = fileparts(this_dir);
+
+    cst_dir = fullfile(root_dir, 'cst');
+    aeps_env0 = load_cst_dir(fullfile(cst_dir, env0_name)); % (nx,ny,t,p,z)
+
+    [nx, ny, ~, ~, ~] = size(aeps_env0);
+    if strcmpi(taper, 'hamming')
+        amplitude = hamming_taper(nx, ny);
+    else
+        amplitude = uniform_taper(nx, ny);
+    end
+    amplitude = amplitude ./ sqrt(sum(amplitude(:).^2)); % normalize power to 1
+
+    phase = ideal_steering(nx, ny, 0.5, 0.5, elev_deg, azim_deg);
+    w = amplitude .* exp(1j * phase);
+
+    power_env0 = to_power(synthesize_field(aeps_env0, w));
+
+    aeps_env1 = load_cst_dir(fullfile(cst_dir, env1_name));
+    power_env1 = to_power(synthesize_field(aeps_env1, w));
+
+    params = struct();
+    params.taper = taper;
+    params.elev_deg = elev_deg;
+    params.azim_deg = azim_deg;
+    params.w = w;
+    params.aeps_env0 = aeps_env0;
+    params.aeps_env1 = aeps_env1;
+    params.power_env0 = power_env0;
+    params.power_env1 = power_env1;
+end
+
+% ========================= Math helpers =========================
+function y = to_power(field)
+    y = sum(abs(field).^2, 3); % (t,p)
+end
+
+function y = to_db(x)
+    y = 10 * log10(max(x, realmin));
+end
+
+function loss = mse_loss(pred_power, target_power)
+    diff = pred_power - target_power;
+    loss = mean(diff(:).^2);
+end
+
+% ========================= Plotting =========================
+function plot_power_db(power_db, titleStr)
+    if nargin < 2, titleStr = ''; end
+    t = linspace(0, pi, size(power_db,1));
+    p = linspace(0, 2*pi, size(power_db,2));
+
+    subplot(1,3,1);
+    imagesc(rad2deg(t), rad2deg(p), power_db.'); set(gca,'YDir','normal');
+    xlabel('\theta (deg)'); ylabel('\phi (deg)'); title('2D'); colorbar;
+
+    subplot(1,3,2);
+    [TT, PP] = ndgrid(t, p);
+    U = sin(TT).*cos(PP); V = sin(TT).*sin(PP);
+    contourf(U, V, power_db, 64, 'LineStyle','none'); axis equal tight;
+    title('Sine-Space'); colorbar;
+
+    subplot(1,3,3);
+    R = (power_db - min(power_db(:))) / max(eps, (max(power_db(:)) - min(power_db(:))));
+    R = 1 + R;
+    X = R .* sin(TT) .* cos(PP);
+    Y = R .* sin(TT) .* sin(PP);
+    Z = R .* cos(TT);
+    surf(X, Y, Z, power_db, 'EdgeColor','none'); view(30, 20);
+    axis vis3d; title('3D'); colorbar;
+    sgtitle(titleStr);
+end
+
+% ========================= Array synthesis =========================
+function field = synthesize_field(aeps, w)
+    S = aeps .* w;                       % (nx,ny,t,p,z)
+    S = sum(S, 1); S = sum(S, 2);        % (1,1,t,p,z)
+    field = squeeze(S);                  % (t,p,z)
+end
+
+% ========================= Pattern row drawing (3 panels per row) =========================
+function draw_pattern_row(tl, row_idx, power_db, label)
+    theta_deg = linspace(0, 180, size(power_db,1));
+    phi_deg   = linspace(0, 360, size(power_db,2));
+
+    % Panels A, B, C corresponding to Python
+    axA = nexttile(tl, (row_idx-1)*3 + 1);
+    imagesc(axA, phi_deg, theta_deg, power_db); set(axA,'YDir','normal');
+    ylabel(axA,'\theta (deg)'); xlabel(axA,'\phi (deg)'); title(axA, [label ' | 2D']);
+
+    axB = nexttile(tl, (row_idx-1)*3 + 2);
+    [TT, PP] = ndgrid(linspace(0, pi, size(power_db,1)), linspace(0, 2*pi, size(power_db,2)));
+    U = sin(TT).*cos(PP); V = sin(TT).*sin(PP);
+    contourf(axB, U, V, power_db, 64, 'LineStyle','none'); axis(axB,'equal'); axis(axB,'tight');
+    title(axB, [label ' | Sine-Space']);
+
+    axC = nexttile(tl, (row_idx-1)*3 + 3);
+    R = (power_db - min(power_db(:))) / max(eps, (max(power_db(:)) - min(power_db(:))));
+    R = 1 + R;
+    X = R .* sin(TT) .* cos(PP);
+    Y = R .* sin(TT) .* sin(PP);
+    Z = R .* cos(TT);
+    surf(axC, X, Y, Z, power_db, 'EdgeColor','none'); view(axC, 30, 20);
+    axis(axC,'vis3d'); title(axC, [label ' | 3D']);
+end
+
+% ========================= Data loading (CST) =========================
+function field = load_cst_file(cst_path)
+    % Load CST antenna pattern data from a file.
+    % Columns: elev_deg, azim_deg, abs_grlz, abs_cross, phase_cross_deg,
+    %          abs_copol, phase_copol_deg, ax_ratio
+    opts = detectImportOptions(cst_path, 'NumHeaderLines', 2);
+    tbl = readmatrix(cst_path, opts); % numeric matrix
+    if size(tbl,2) < 8
+        tbl = readmatrix(cst_path, 'NumHeaderLines', 2);
+    end
+    data = tbl(:, 1:8);
+
+    % Sort by elev_deg then azim_deg (as in Python)
+    data = sortrows(data, [1 2]);
+
+    phase_cross = deg2rad(data(:,5));
+    phase_copol = deg2rad(data(:,7));
+    E_cross = sqrt(data(:,4)) .* exp(1j * phase_cross);
+    E_copol = sqrt(data(:,6)) .* exp(1j * phase_copol);
+    field = cat(3, E_cross, E_copol);  % (N, 2)
+
+    % Reshape to (elev, azim, n_pol) => (181, 360, 2), then drop last elev
+    try
+        field = reshape(field, [360, 181, 2]);
+    catch
+        error('Unexpected CST file length in %s; cannot reshape to 360x181x2', cst_path);
+    end
+    field = field(:, 1:end-1, :); % (180,360,2)
+end
+
+function aeps = load_cst_dir(cst_dir)
+    % Robust CST loader that handles names like 'farfield (f=...) [10]_RG.txt'
+    d = dir(fullfile(cst_dir, '*_RG*.txt'));
+    if isempty(d)
+        error('No CST files matching *_RG*.txt found in %s', cst_dir);
+    end
+
+    % Extract indices from [N] or before _RG
+    idx = zeros(numel(d),1);
+    for k = 1:numel(d)
+        nm = d(k).name;
+        t = regexp(nm, '\[(\d+)\]', 'tokens', 'once');
+        if isempty(t)
+            t = regexp(nm, '(\d+)\s*_RG', 'tokens', 'once');
+        end
+        if isempty(t)
+            error('File %s missing bracketed index', nm);
+        end
+        if iscell(t), token = t{1}; else, token = t; end
+        idx(k) = str2double(token) - 1; % zero-based for sorting
+    end
+    [~, order] = sort(idx);
+    d = d(order);
+
+    fields = cell(numel(d),1);
+    for k = 1:numel(d)
+        fields{k} = load_cst_file(fullfile(d(k).folder, d(k).name));
+    end
+    fields = cat(4, fields{:});           % (t,p,z, n_elems)
+    fields = permute(fields, [4 1 2 3]);  % (n_elems, t,p,z)
+
+    if size(fields,1) ~= 16
+        error('Expected 16 elements; got %d', size(fields,1));
+    end
+    fields = reshape(fields, [4 4 size(fields,2) size(fields,3) size(fields,4)]); % (4,4,t,p,z)
+    aeps = permute(fields, [2 1 3 4 5]); % (n_x, n_y, t, p, z)
+end
+
+% ========================= Tapering and steering =========================
+function amplitude = uniform_taper(nx, ny)
+    amplitude = ones(nx, ny);
+end
+
+function amplitude = hamming_taper(nx, ny)
+    amplitude = hamming(nx) * hamming(ny).';
+end
+
+function phase = ideal_steering(nx, ny, dx, dy, elev_deg, azim_deg)
+    % Spacing in wavelengths (dx, dy)
+    elev_rad = deg2rad(elev_deg);
+    azim_rad = deg2rad(azim_deg);
+    sin_elev = sin(elev_rad);
+    sin_azim = sin(azim_rad); cos_azim = cos(azim_rad);
+
+    i = (0:nx-1) - (nx-1)/2;
+    j = (0:ny-1) - (ny-1)/2;
+    [ii, jj] = ndgrid(i, j);
+
+    kd_x = 2*pi*dx*ii;
+    kd_y = 2*pi*dy*jj;
+    phase = kd_x .* sin_elev .* cos_azim + kd_y .* sin_elev .* sin_azim;
+end
+
+% ========================= Colormap and interactivity =========================
+function cmap = bwr_blue_positive(n)
+    % Diverging colormap: Red (neg) - White (zero) - Blue (pos)
+    if nargin < 1 || isempty(n)
+        n = 256;
+    end
+    m = ceil(n/2);
+    % Negative (red -> white)
+    r1 = linspace(0.65, 1.0, m).';
+    g1 = linspace(0.00, 1.0, m).';
+    b1 = linspace(0.00, 1.0, m).';
+    neg = [r1 g1 b1];
+    % Positive (white -> blue)
+    r2 = linspace(1.0, 0.00, m).';
+    g2 = linspace(1.0, 0.20, m).';
+    b2 = linspace(1.0, 0.65, m).';
+    pos = [r2 g2 b2];
+    % Combine, removing duplicate white row
+    cmap = [neg(1:end-1,:); pos];
+    % Trim to n rows if needed
+    if size(cmap,1) > n
+        cmap = interp1(linspace(0,1,size(cmap,1)), cmap, linspace(0,1,n));
+    end
+end
+
+function enable_datatip(fig, TH, R, Z)
+    % Enable datatip on the figure, reporting nearest grid value in (azim,elev)
+    dcm = datacursormode(fig);
+    dcm.Enable = 'on';
+    dcm.DisplayStyle = 'datatip';
+    dcm.SnapToDataVertex = 'off';
+    set(dcm,'UpdateFcn', @(obj, event) dt_update(event, TH, R, Z)); %#ok<NASGU>
+end
+
+function txt = dt_update(event, TH, R, Z)
+    pos = event.Position; x = pos(1); y = pos(2);
+    % Convert (x,y) back to polar as used for plotting
+    evR = hypot(x, y);
+    evTH = atan2(x, y); % inverse of X=R*sin(TH), Y=R*cos(TH)
+    % Wrap angle to [0, 2pi)
+    if evTH < 0, evTH = evTH + 2*pi; end
+
+    azim_unique = unique(TH(1,:));
+    elev_unique = unique(R(:,1));
+    [~, j] = min(abs(azim_unique - evTH));
+    [~, i] = min(abs(elev_unique - evR));
+    val = Z(i, j);
+    txt = {sprintf('Azim: %d°', round(rad2deg(azim_unique(j)))), ...
+           sprintf('Elev: %d°', round(elev_unique(i))), ...
+           sprintf('\x0394NMSE: %.3f dB', val)};
+end

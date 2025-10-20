@@ -2,7 +2,7 @@ import typing as tp
 from functools import partial
 from pathlib import Path
 from typing import Literal, NamedTuple, get_args
-
+import time
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -122,6 +122,10 @@ def train_step(
     loss, grads = jax.value_and_grad(loss_wrapper)(w)
     w = w - lr * grads
     # w = w / jnp.linalg.norm(w) * amplitude  # Re-normalize
+    # amplitude = jnp.abs(w)
+    # norm_factor = np.sqrt(np.sum(amplitude**2))
+    # w = w / norm_factor
+    # w = my_norm(w)
     return w, loss
 
 
@@ -132,18 +136,21 @@ def optimize(
     loss_fn: LossFn = mse_loss,
     loss_scale: LossScale = "db",
     lr: float = 1e-5,
+    iter_num = 200
 ) -> jax.Array:
     w = w_init
-    for step in range(100):
+    for step in range(iter_num):
         w, loss = train_step(w, aeps, target_power, lr, loss_fn, loss_scale)
         if step % 10 == 0:
-            print(f"step {step}, loss: {loss:.3f}")
+            amplitude = np.abs(w)
+            norm_factor = np.sqrt(np.sum(amplitude**2))
+            print(f"step {step}, loss: {loss:.3f} | w sum: {norm_factor:.2f}")
 
     print(f"Weight norm: {jnp.linalg.norm(w):.3f}")
 
     pattern_opt = jnp.einsum("xy,xytpz->tpz", w, aeps)
     power_db_opt = to_power_db(pattern_opt)
-    return power_db_opt
+    return power_db_opt, w
 
 
 Taper = Literal["hamming", "uniform"]
@@ -203,6 +210,11 @@ class OptResults(NamedTuple):
     nmse_env1: float
     nmse_opt: float
 
+def my_norm(w):
+    amplitude = np.abs(w)
+    norm_factor = np.sqrt(np.sum(amplitude**2))
+    w = w / norm_factor
+    return w
 
 # @memory.cache
 def run_optimization(
@@ -215,6 +227,8 @@ def run_optimization(
     loss_scale: LossScale = "db",
     lr: float = 1e-5,
     plot: bool = True,
+    init_w = 'taper',
+    iter_num = 200
 ):
     print(f"Running optimization for elev {elev_deg}°, azim {azim_deg}°, {taper} taper")
     params = init_params(
@@ -225,7 +239,29 @@ def run_optimization(
         env1_name=env1_name,
     )
     w, aeps_env1, power_env0 = params.w, params.aeps_env1, params.power_env0
-    power_db_opt = optimize(w, aeps_env1, power_env0, loss_fn, loss_scale, lr)
+    if init_w != 'taper':
+        cst_dir = root_dir / "cst"
+        aeps_env0 = load_cst(cst_dir / env0_name)
+        nx, ny = aeps_env0.shape[:2]
+        if init_w == "hamming":
+            print(f' -- using {init_w:s} taper as init weight -- ')
+            amplitude = hamming_taper(nx=nx, ny=ny)
+        elif init_w == 'uniform':
+            print(f' -- using {init_w:s} taper as init weight -- ')
+            # amplitude = uniform_taper(nx=nx, ny=ny)
+            amplitude = np.ones([nx, ny])
+            # print(f'normalized amplitude sum is: {np.sum(amplitude**2):.2f}')
+            phase = np.zeros([nx, ny])
+            w = my_norm(amplitude * np.exp(1j * phase))
+        elif init_w == 'random':
+            print(f' -- using {init_w:s} taper as init weight -- ')
+            amplitude = np.random.rand(nx, ny)
+            # print(f'normalized amplitude sum is: {np.sum(amplitude**2):.2f}')
+            phase = np.random.rand(nx, ny) * 2 * np.pi - np.pi
+            w = my_norm(amplitude * np.exp(1j * phase))
+        else:
+            print(f'did not find matching to {init_w:s}')
+    power_db_opt, w = optimize(w, aeps_env1, power_env0, loss_fn, loss_scale, lr, iter_num)
 
     power_db_env0, power_db_env1 = to_db(params.power_env0), to_db(params.power_env1)
 
@@ -258,11 +294,49 @@ def run_optimization(
         fig.savefig(name, dpi=200)
         print(f"Saved figure to {name}")
 
-    return OptResults(
+        # Additional weights visualization (magnitude and phase)
+        try:
+            w_np = np.asarray(w)
+            w_np_norm = w_np * np.exp(-1j*np.angle(w_np[1][1]))
+            figW, (ax1, ax2) = plt.subplots(
+                1,
+                2,
+                figsize=(9, 4),
+                layout="compressed",
+            )
+
+            im1 = ax1.imshow(np.abs(w_np_norm), origin="upper")
+            ax1.set_aspect("equal")
+            figW.colorbar(im1, ax=ax1)
+            ax1.set_title("w magnitude")
+            ax1.set_xlabel("x index")
+            ax1.set_ylabel("y index")
+
+            phase_deg = np.degrees(np.angle(w_np_norm))
+            im2 = ax2.imshow(
+                phase_deg,
+                origin="upper",
+                cmap="hsv",
+                vmin=-180,
+                vmax=180,
+            )
+            ax2.set_aspect("equal")
+            figW.colorbar(im2, ax=ax2)
+            ax2.set_title("w phase (deg)")
+            ax2.set_xlabel("x index")
+            ax2.set_ylabel("y index")
+
+            nameW = f"weights_{taper}_elev_{int(elev_deg)}_azim_{int(azim_deg)}.png"
+            figW.savefig(nameW, dpi=200)
+            print(f"Saved weights figure to {nameW}")
+        except Exception as e:
+            print(f"Failed to plot weights: {e}")
+
+    return [OptResults(
         power_db_opt=power_db_opt,
         nmse_env1=nmse_env1,
         nmse_opt=nmse_opt,
-    )
+    ), w]
 
 
 # run_optimization(
@@ -282,8 +356,8 @@ def evaluate_grid(
     loss_scale: LossScale = "db",
     lr: float = 5e-6,
 ) -> None:
-    elevs = np.arange(0, 45, 5)
-    azims = np.arange(0, 360, 10)
+    elevs = np.arange(0, 30, 10)
+    azims = np.arange(0, 360, 30)
     results = {}
 
     opt = partial(
@@ -300,7 +374,8 @@ def evaluate_grid(
     for elev in elevs:
         for azim in azims:
             elev_deg, azim_deg = elev.item(), azim.item()
-            results[(elev, azim)] = opt(elev_deg=elev_deg, azim_deg=azim_deg)
+            res, _ = opt(elev_deg=elev_deg, azim_deg=azim_deg)
+            results[(elev, azim)] = res
 
     nmses_env1 = np.array([res.nmse_env1 for res in results.values()]).reshape(
         len(elevs), len(azims)
@@ -351,23 +426,73 @@ def evaluate_grid(
         )
         fig.savefig(name, dpi=200)
 
+tic = time.time()
 
-for env in [
-    "Env1_rotated",
-    "Env2_rotated",
-    "Env1_1_rotated",
-    "Env1_2_rotated",
-    "Env2_1_rotated",
-    "Env2_2_rotated",
-]:
-    for taper in get_args(Taper):
-        for loss_fn in [mse_loss]:
-            for loss_scale in tp.get_args(LossScale):
-                for lr in [1e-5, 5e-6]:
-                    evaluate_grid(
-                        env1_name=env,
-                        taper=taper,
-                        loss_fn=loss_fn,
-                        loss_scale=loss_scale,
-                        lr=lr,
-                    )
+# #  ----------------- TEST SINGLE OPTIMIZATION -----------------
+print('run single optimization')
+# env0_name = "no_env_rotated"
+# env1_name = "Env1_rotated"
+# taper = "hamming"
+# elev_deg = 40.0
+# azim_deg = 40.0
+# loss_fn = mse_loss
+# loss_scale = "linear"
+# lr = 1e-5
+# plot = True
+azim_degs = [0] # [0,90,180,270]
+for azim_deg in azim_degs:
+    [temp, w] = run_optimization(
+        env0_name = "no_env_rotated",
+        env1_name = "Env2_1_rotated",
+        taper = "hamming",  # 'uniform' | 'hamming'
+        elev_deg = 30.0,
+        azim_deg = azim_deg,
+        loss_fn = mse_loss,
+        loss_scale = "linear",
+        lr = 2.5e-5,
+        plot = True,
+        init_w = 'uniform', # 'taper' , 'uniform', 'random'
+        iter_num = 400
+        )
+
+
+
+# ----------------- TEST FULL OPTIMIZATION -----------------
+
+# env = "Env1_rotated"
+# taper = "hamming"
+# loss_fn = mse_loss
+# loss_scale = 'linear'
+# lr = 1e-6
+# evaluate_grid(
+#     env1_name=env,
+#     taper=taper,
+#     loss_fn=loss_fn,
+#     loss_scale=loss_scale,
+#     lr=lr,
+# )
+
+# -------------------------------------------------------------------------------------
+
+print(f'total run time: {time.time()-tic:.0f} sec = {(time.time()-tic)/60:.0f} min')
+print('done')
+
+# for env in [
+#     "Env1_rotated",
+#     "Env2_rotated",
+#     "Env1_1_rotated",
+#     "Env1_2_rotated",
+#     "Env2_1_rotated",
+#     "Env2_2_rotated",
+# ]:
+#     for taper in get_args(Taper):
+#         for loss_fn in [mse_loss]:
+#             for loss_scale in tp.get_args(LossScale):
+#                 for lr in [1e-5, 5e-6]:
+#                     evaluate_grid(
+#                         env1_name=env,
+#                         taper=taper,
+#                         loss_fn=loss_fn,
+#                         loss_scale=loss_scale,
+#                         lr=lr,
+#                     )
