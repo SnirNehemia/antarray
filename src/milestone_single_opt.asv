@@ -1,26 +1,33 @@
 
 mode = 'test_single'; % 'test_single' | 'evaluate_grid'
+
+env1_name = 'Env1_1_rotated';
+taper = 'hamming';
+init_w = 'uniform'; % 'taper' | 'hamming' | 'uniform' | 'random'
+nsteps = 100;
 tic()
 switch mode
     case 'test_single'
-        env0_name = 'no_env_rotated';
-        env1_name = 'Env1_rotated';
-        taper = 'hamming';
-        loss_fn = @mse_loss;
-        loss_scale = 'linear'; % or 'db'
-        lr = 1e-5;
-
-        elev_deg = 0;
-        azim_deg = azim_degs(i);
-
-        [res, w] = run_optimization(env0_name, env1_name, taper, elev_deg, azim_deg, loss_fn, loss_scale, lr, true);
+        azim_degs = [0];%[0,90,180,270];
+        for i=1:length(azim_degs)
+            env0_name = 'no_env_rotated';
+            loss_fn = @mse_loss;
+            loss_scale = 'linear'; % or 'db'
+            lr = 2000e-5;
+            
+            elev_deg = 0;
+            azim_deg = azim_degs(i);
+    
+            [res, w] = run_optimization(env0_name, env1_name, taper, elev_deg, azim_deg,...
+                loss_fn, loss_scale, lr, init_w, nsteps, true);
+        end
     case 'evaluate_grid'
-        milestone()
+        milestone(env1_name, taper, init_w, nsteps);
 end
 fprintf('total runtime is: %.0f sec = %.1f min\n', toc(), toc()/60);
 
 
-function milestone()
+function milestone(env, taper, init_w, nsteps)
 % MATLAB port of src/milestone.py with plotting and interactivity tweaks
 % - Loads CST patterns for two environments
 % - Builds initial tapered/steered weights
@@ -28,17 +35,18 @@ function milestone()
 % - Evaluates a grid of pointings and saves ΔNMSE plots
 % Default call replicates the Python evaluation grid output.
     tic()
-    env = 'Env1_rotated';
-    taper = 'hamming';
+    % env = 'Env1_rotated';
+    % taper = 'hamming';
     loss_scale = 'linear';
-    lr = 1e-6;
-    evaluate_grid('no_env_rotated', env, taper, @mse_loss, loss_scale, lr);
+    lr = 2000e-5;
+    evaluate_grid('no_env_rotated', env, taper, @mse_loss, loss_scale, lr,...
+     init_w, nsteps);
     fprintf('total runtime is: %.0f sec = %.1f min\n', toc(), toc()/60);
     fprintf('done!')
 end
 
 % ========================= Top-level API =========================
-function evaluate_grid(env0_name, env1_name, taper, loss_fn, loss_scale, lr)
+function evaluate_grid(env0_name, env1_name, taper, loss_fn, loss_scale, lr, init_w, nsteps)
     if nargin < 1 || isempty(env0_name), env0_name = 'no_env_rotated'; end
     if nargin < 2 || isempty(env1_name), env1_name = 'Env1_rotated'; end
     if nargin < 3 || isempty(taper),     taper = 'hamming'; end
@@ -46,7 +54,7 @@ function evaluate_grid(env0_name, env1_name, taper, loss_fn, loss_scale, lr)
     if nargin < 5 || isempty(loss_scale), loss_scale = 'db'; end
     if nargin < 6 || isempty(lr),        lr = 5e-6; end
 
-    elevs = 0:10:30;      % 0, 15, 30
+    elevs = 0:10:40;      % 0, 15, 30
     azims = 0:30:360;     % 0, 90, 180, 270
 
     % Evaluate optimization at each grid point
@@ -55,7 +63,8 @@ function evaluate_grid(env0_name, env1_name, taper, loss_fn, loss_scale, lr)
         for ai = 1:numel(azims)
             elev_deg = elevs(ei);
             azim_deg = azims(ai);
-            [res, w] = run_optimization(env0_name, env1_name, taper, elev_deg, azim_deg, loss_fn, loss_scale, lr, false);
+            [res, w] = run_optimization(env0_name, env1_name, taper, elev_deg, azim_deg,...
+                loss_fn, loss_scale, lr, init_w, nsteps, false);
             results{ei, ai} = res;
         end
     end
@@ -71,11 +80,11 @@ function evaluate_grid(env0_name, env1_name, taper, loss_fn, loss_scale, lr)
         end
     end
 
-    nmse_diff = nmses_opt - nmses_env1; % match Python
-    fprintf('Mean NMSE Improvement: %.3f dB\n', mean(nmse_diff(:)));
-    fprintf('Std NMSE Improvement: %.3f dB\n', std(nmse_diff(:)));
-    fprintf('Max NMSE Improvement: %.3f dB\n', max(nmse_diff(:)));
-    fprintf('Min NMSE Improvement: %.3f dB\n', min(nmse_diff(:)));
+    nmse_diff = nmses_env1 - nmses_opt; % check with Gal this is the right sign
+    fprintf('Mean NMSE Improvement: %.2f dB\n', mean(nmse_diff(:)));
+    fprintf('Std NMSE Improvement: %.2f dB\n', std(nmse_diff(:)));
+    fprintf('Max NMSE Improvement: %.2f dB\n', max(nmse_diff(:)));
+    fprintf('Min NMSE Improvement: %.2f dB\n', min(nmse_diff(:)));
 
     % Polar-like colored mesh: θ = azim, r = elev
     azim_rad = deg2rad(azims);
@@ -102,16 +111,30 @@ function evaluate_grid(env0_name, env1_name, taper, loss_fn, loss_scale, lr)
     exportgraphics(fig, name, 'Resolution', 200);
 end
 
-function [res, w] = run_optimization(env0_name, env1_name, taper, elev_deg, azim_deg, loss_fn, loss_scale, lr, do_plot)
-    if nargin < 9, do_plot = true; end
+function [res, w] = run_optimization(env0_name, env1_name, taper, elev_deg, azim_deg, loss_fn, loss_scale, lr, init_w, nsteps, do_plot)
+    if nargin < 11, do_plot = true; end
     fprintf('Running optimization for elev %g°, azim %g°, %s taper\n', elev_deg, azim_deg, taper);
 
     params = init_params(env0_name, env1_name, taper, elev_deg, azim_deg);
     w = params.w;
+    switch init_w
+        case 'random'
+            w = rand(size(w)) .* exp(1i*rand(size(w))*2*pi);
+        case 'uniform'
+            amplitude = uniform_taper(size(w,1), size(w,2));
+            phase = ideal_steering(size(w,1), size(w,2), 0.5, 0.5, elev_deg, azim_deg);
+            w = amplitude .* exp(1j * phase);
+        case 'hamming'
+            amplitude = hamming_taper(size(w,1), size(w,2));
+            phase = ideal_steering(size(w,1), size(w,2), 0.5, 0.5, elev_deg, azim_deg);
+            w = amplitude .* exp(1j * phase);
+    end
+    w = my_norm(w);
+    w_0 = w;
     aeps_env1 = params.aeps_env1;
     power_env0 = params.power_env0;
 
-    [power_db_opt, w] = optimize(w, aeps_env1, power_env0, loss_fn, loss_scale, lr);
+    [power_db_opt, w] = optimize(w, aeps_env1, power_env0, loss_fn, loss_scale, lr, nsteps);
 
     power_db_env0 = to_db(params.power_env0);
     power_db_env1 = to_db(params.power_env1);
@@ -134,8 +157,8 @@ function [res, w] = run_optimization(env0_name, env1_name, taper, elev_deg, azim
         tl = tiledlayout(fig, 3, 3, 'Padding','compact', 'TileSpacing','compact');
 
         draw_pattern_row(tl, 1, power_db_env0', 'No Env');
-        draw_pattern_row(tl, 2, power_db_env1', sprintf('Env 1 | NMSE %.3fdB', nmse_env1));
-        draw_pattern_row(tl, 3, power_db_opt',  sprintf('Optimized | NMSE %.3fdB', nmse_opt));
+        draw_pattern_row(tl, 2, power_db_env1', sprintf('Env 1 | NMSE %.1fdB', nmse_env1));
+        draw_pattern_row(tl, 3, power_db_opt',  sprintf('Optimized | NMSE %.1fdB', nmse_opt));
 
         steer_title = sprintf('Steering Elev %d°, Azim %d°', round(elev_deg), round(azim_deg));
         title(tl, sprintf('%s taper | %s', taper, steer_title));
@@ -149,34 +172,101 @@ function [res, w] = run_optimization(env0_name, env1_name, taper, elev_deg, azim
         % Additional weights visualization (magnitude and phase)
         figW = figure('Position',[100 100 900 400]);
         tW = tiledlayout(figW,1,2,'Padding','compact','TileSpacing','compact');
+        sgtitle('Optimized weights')
         ax1 = nexttile(tW,1);
         imagesc(ax1, abs(w)); axis(ax1,'image'); colorbar(ax1);
         title(ax1, 'w magnitude'); xlabel(ax1,'x index'); ylabel(ax1,'y index');
+        % Loop through the matrix and add text labels
+        C = abs(w);
+        [rows, cols] = size(C);
+        for i = 1:rows
+            for j = 1:cols
+                txt = sprintf('%.1f',C(i,j));
+                text(j, i, txt, 'HorizontalAlignment', 'center', 'VerticalAlignment', 'middle', 'Color', 'k');
+            end
+        end
+        clim([0,1])
+
         ax2 = nexttile(tW,2);
         imagesc(ax2, rad2deg(angle(w))); axis(ax2,'image'); colorbar(ax2);
         colormap(ax2, 'hsv'); caxis(ax2, [-180, 180]);
         title(ax2, 'w phase (deg)'); xlabel(ax2,'x index'); ylabel(ax2,'y index');
         nameW = sprintf('MATLAB_weights_%s_elev_%d_azim_%d.png', taper, round(elev_deg), round(azim_deg));
+        C = angle(w)*180/pi;
+        [rows, cols] = size(C);
+        for i = 1:rows
+            for j = 1:cols
+                txt = sprintf('%.0f%c',C(i,j), char(176));
+                text(j, i, txt, 'HorizontalAlignment', 'center', 'VerticalAlignment', 'middle', 'Color', 'k');
+            end
+        end
         exportgraphics(figW, nameW, 'Resolution', 200);
+
+        % Initial weights visualization (magnitude and phase)
+        figW = figure('Position',[100 100 900 400]);
+        tW = tiledlayout(figW,1,2,'Padding','compact','TileSpacing','compact');
+        sgtitle('Initial weight guess')
+        ax1 = nexttile(tW,1);
+        imagesc(ax1, abs(w_0)); axis(ax1,'image'); colorbar(ax1);
+        title(ax1, 'w magnitude'); xlabel(ax1,'x index'); ylabel(ax1,'y index');
+        % Loop through the matrix and add text labels
+        C = abs(w_0);
+        [rows, cols] = size(C);
+        for i = 1:rows
+            for j = 1:cols
+                txt = sprintf('%.1f',C(i,j));
+                text(j, i, txt, 'HorizontalAlignment', 'center', 'VerticalAlignment', 'middle', 'Color', 'k');
+            end
+        end
+        clim([0,1])
+
+        ax2 = nexttile(tW,2);
+        imagesc(ax2, rad2deg(angle(w_0))); axis(ax2,'image'); colorbar(ax2);
+        colormap(ax2, 'hsv'); caxis(ax2, [-180, 180]);
+        title(ax2, 'w phase (deg)'); xlabel(ax2,'x index'); ylabel(ax2,'y index');
+        nameW = sprintf('MATLAB_weights_%s_elev_%d_azim_%d.png', taper, round(elev_deg), round(azim_deg));
+        C = angle(w_0)*180/pi;
+        [rows, cols] = size(C);
+        for i = 1:rows
+            for j = 1:cols
+                txt = sprintf('%.0f%c',C(i,j), char(176));
+                text(j, i, txt, 'HorizontalAlignment', 'center', 'VerticalAlignment', 'middle', 'Color', 'k');
+            end
+        end
     end
 
     res = struct('power_db_opt', power_db_opt, 'nmse_env1', nmse_env1, 'nmse_opt', nmse_opt);
 end
 
+function w = my_norm(w)
+    norm_factor = sqrt(sum(abs(w).^2,'all'));
+    w = w./norm_factor;
+end
+
 % ========================= Optimization =========================
-function [power_db_opt, w] = optimize(w_init, aeps, target_power, loss_fn, loss_scale, lr)
+function [power_db_opt, w] = optimize(w_init, aeps, target_power, loss_fn, loss_scale, lr, nsteps)
     w = w_init; % complex (n_x, n_y)
-    nsteps = 100;
+    min_loss = 1e6;
     for step = 0:nsteps-1
         [w, loss] = train_step(w, aeps, target_power, lr, loss_fn, loss_scale);
+        w = my_norm(w);
+        if min_loss > loss
+            min_loss = loss;
+            min_w = w;
+            pattern_opt = synthesize_field(aeps, w);      % (t,p,z)
+            power_db_opt = to_db(to_power(pattern_opt));  % (t,p)
+        end
         if mod(step,10) == 0
             fprintf('step %d, loss: %.3f\n', step, real(loss));
         end
     end
     fprintf('Weight norm: %.3f\n', norm(w(:)));
+    
+    % --- For debugging final values
+    % pattern_opt = synthesize_field(aeps, w);      % (t,p,z)
+    % power_db_opt = to_db(to_power(pattern_opt));  % (t,p)
 
-    pattern_opt = synthesize_field(aeps, w);      % (t,p,z)
-    power_db_opt = to_db(to_power(pattern_opt));  % (t,p)
+    w = min_w;
 end
 
 function [w_next, loss_val] = train_step(w, aeps, target_power, lr, loss_fn, loss_scale)
@@ -306,13 +396,19 @@ function draw_pattern_row(tl, row_idx, power_db, label)
     % Panels A, B, C corresponding to Python
     axA = nexttile(tl, (row_idx-1)*3 + 1);
     imagesc(axA, phi_deg, theta_deg, power_db); set(axA,'YDir','normal');
-    ylabel(axA,'\theta (deg)'); xlabel(axA,'\phi (deg)'); title(axA, [label ' | 2D']);
+    plot_title = sprintf('%s | G_{max}=%.1fdBi | 2D', label, max(power_db,[],'all'));
+    ylabel(axA,'\theta (deg)'); xlabel(axA,'\phi (deg)'); 
+    title(axA, plot_title, 'FontSize',8);
+    colorbar
 
     axB = nexttile(tl, (row_idx-1)*3 + 2);
     [TT, PP] = ndgrid(linspace(0, pi, size(power_db,1)), linspace(0, 2*pi, size(power_db,2)));
     U = sin(TT).*cos(PP); V = sin(TT).*sin(PP);
     contourf(axB, U, V, power_db, 64, 'LineStyle','none'); axis(axB,'equal'); axis(axB,'tight');
-    title(axB, [label ' | Sine-Space']);
+    plot_title = sprintf('%s | G_{max}=%.1fdBi | Sine-Space', label, max(power_db,[],'all'));
+    title(axB, plot_title, 'FontSize',8);
+    clim([-40,10])
+    colorbar
 
     axC = nexttile(tl, (row_idx-1)*3 + 3);
     R = (power_db - min(power_db(:))) / max(eps, (max(power_db(:)) - min(power_db(:))));
@@ -321,7 +417,11 @@ function draw_pattern_row(tl, row_idx, power_db, label)
     Y = R .* sin(TT) .* sin(PP);
     Z = R .* cos(TT);
     surf(axC, X, Y, Z, power_db, 'EdgeColor','none'); view(axC, 30, 20);
-    axis(axC,'vis3d'); title(axC, [label ' | 3D']);
+    axis(axC,'vis3d');
+    plot_title = sprintf('%s | G_{max}=%.1fdBi | 3D', label, max(power_db,[],'all'));
+    title(axC, plot_title, 'FontSize',8);
+    clim([-40,10])
+    colorbar
 end
 
 % ========================= Data loading (CST) =========================

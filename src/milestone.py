@@ -136,11 +136,19 @@ def optimize(
     loss_fn: LossFn = mse_loss,
     loss_scale: LossScale = "db",
     lr: float = 1e-5,
-    iter_num = 200
+    iter_num = 200,
+    global_min = True
 ) -> jax.Array:
     w = w_init
+    min_loss = 1e3
     for step in range(iter_num):
         w, loss = train_step(w, aeps, target_power, lr, loss_fn, loss_scale)
+        w = my_norm(w)
+        if global_min and loss < min_loss:
+            min_loss = loss
+            min_w = w
+            pattern_opt = jnp.einsum("xy,xytpz->tpz", w, aeps)
+            min_pattern = to_power_db(pattern_opt)
         if step % 10 == 0:
             amplitude = np.abs(w)
             norm_factor = np.sqrt(np.sum(amplitude**2))
@@ -148,9 +156,13 @@ def optimize(
 
     print(f"Weight norm: {jnp.linalg.norm(w):.3f}")
 
-    pattern_opt = jnp.einsum("xy,xytpz->tpz", w, aeps)
-    power_db_opt = to_power_db(pattern_opt)
-    return power_db_opt, w
+    
+    if global_min:
+        return min_pattern, min_w
+    else:
+        pattern_opt = jnp.einsum("xy,xytpz->tpz", w, aeps)
+        power_db_opt = to_power_db(pattern_opt)
+        return power_db_opt, w
 
 
 Taper = Literal["hamming", "uniform"]
@@ -228,7 +240,8 @@ def run_optimization(
     lr: float = 1e-5,
     plot: bool = True,
     init_w = 'taper',
-    iter_num = 200
+    iter_num = 200,
+    global_min = True
 ):
     print(f"Running optimization for elev {elev_deg}°, azim {azim_deg}°, {taper} taper")
     params = init_params(
@@ -261,7 +274,7 @@ def run_optimization(
             w = my_norm(amplitude * np.exp(1j * phase))
         else:
             print(f'did not find matching to {init_w:s}')
-    power_db_opt, w = optimize(w, aeps_env1, power_env0, loss_fn, loss_scale, lr, iter_num)
+    power_db_opt, w = optimize(w, aeps_env1, power_env0, loss_fn, loss_scale, lr, iter_num, global_min=global_min)
 
     power_db_env0, power_db_env1 = to_db(params.power_env0), to_db(params.power_env1)
 
@@ -443,16 +456,17 @@ azim_degs = [0] # [0,90,180,270]
 for azim_deg in azim_degs:
     [temp, w] = run_optimization(
         env0_name = "no_env_rotated",
-        env1_name = "Env2_1_rotated",
-        taper = "hamming",  # 'uniform' | 'hamming'
-        elev_deg = 30.0,
+        env1_name = "Env3_1_rotated",
+        taper = "uniform",  # 'uniform' | 'hamming'
+        elev_deg = 0.0,
         azim_deg = azim_deg,
         loss_fn = mse_loss,
         loss_scale = "linear",
-        lr = 2.5e-5,
+        lr = 1e-5,
         plot = True,
-        init_w = 'uniform', # 'taper' , 'uniform', 'random'
-        iter_num = 400
+        init_w = 'uniform', # 'taper' , 'uniform', 'random', 'hamming'
+        iter_num = 5000,
+        global_min = True
         )
 
 
